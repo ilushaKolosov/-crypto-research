@@ -1,0 +1,1990 @@
+diff --git a/src/report/DataStatsReport.java b/src/report/DataStatsReport.java
+new file mode 100644
+index 0000000..e7d4025
+--- /dev/null
++++ b/src/report/DataStatsReport.java
+@@ -0,0 +1,122 @@
++package report;
++
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++import core.DTNHost;
++import core.Message;
++import core.MessageListener;
++import core.Settings;
++
++/**
++ * Message statistics that separate data messages from PoDC control
++ * messages (ids starting with {@code PoDC_ACK_}), so that every router is
++ * evaluated on the same data traffic. Control relays are reported
++ * separately and added to the total overhead.
++ *
++ * Optional setting {@code DataStatsReport.maliciousPrefix}: host name
++ * prefix of malicious nodes; transfers of data messages to such nodes
++ * are counted as "absorbed".
++ */
++public class DataStatsReport extends Report implements MessageListener {
++	public static final String ACK_PREFIX = "PoDC_ACK_";
++
++	private Map<String, Double> creationTimes;
++	private Set<String> deliveredIds;
++	private List<Double> latencies;
++	private List<Integer> hopCounts;
++	private int created, delivered;
++	private long relayedData, relayedCtrl, bytesData, bytesCtrl;
++	private long toMalicious, dataTransfersTotal;
++	private String maliciousPrefix;
++
++	public DataStatsReport() {
++		init();
++		Settings s = new Settings("DataStatsReport");
++		maliciousPrefix = s.contains("maliciousPrefix")
++				? s.getSetting("maliciousPrefix") : null;
++	}
++
++	@Override
++	protected void init() {
++		super.init();
++		creationTimes = new HashMap<String, Double>();
++		deliveredIds = new HashSet<String>();
++		latencies = new ArrayList<Double>();
++		hopCounts = new ArrayList<Integer>();
++		created = delivered = 0;
++		relayedData = relayedCtrl = bytesData = bytesCtrl = 0;
++		toMalicious = dataTransfersTotal = 0;
++	}
++
++	private static boolean isCtrl(Message m) {
++		return m.getId().startsWith(ACK_PREFIX);
++	}
++
++	private boolean isMalicious(DTNHost h) {
++		return maliciousPrefix != null
++				&& h.toString().startsWith(maliciousPrefix);
++	}
++
++	public void newMessage(Message m) {
++		if (isCtrl(m)) return;
++		if (isWarmup()) { addWarmupID(m.getId()); return; }
++		creationTimes.put(m.getId(), getSimTime());
++		created++;
++	}
++
++	public void messageTransferred(Message m, DTNHost from, DTNHost to,
++			boolean firstDelivery) {
++		if (isWarmupID(m.getId())) return;
++		if (isCtrl(m)) {
++			relayedCtrl++;
++			bytesCtrl += m.getSize();
++			return;
++		}
++		if (!creationTimes.containsKey(m.getId())) return;
++		relayedData++;
++		bytesData += m.getSize();
++		dataTransfersTotal++;
++		if (isMalicious(to)) toMalicious++;
++		if (firstDelivery && deliveredIds.add(m.getId())) {
++			delivered++;
++			latencies.add(getSimTime() - creationTimes.get(m.getId()));
++			hopCounts.add(m.getHops().size() - 1);
++		}
++	}
++
++	public void messageDeleted(Message m, DTNHost where, boolean dropped) {}
++	public void messageTransferAborted(Message m, DTNHost from, DTNHost to) {}
++	public void messageTransferStarted(Message m, DTNHost from, DTNHost to) {}
++
++	@Override
++	public void done() {
++		double dr = created > 0 ? (double) delivered / created : 0;
++		double ohData = delivered > 0
++				? (double) (relayedData - delivered) / delivered : Double.NaN;
++		double ohTotal = delivered > 0
++				? (double) (relayedData + relayedCtrl - delivered) / delivered
++				: Double.NaN;
++		double absorbed = dataTransfersTotal > 0
++				? (double) toMalicious / dataTransfersTotal : 0;
++		write("scenario: " + getScenarioName());
++		write("created: " + created);
++		write("delivered: " + delivered);
++		write("delivery_ratio: " + format(dr));
++		write("overhead_data: " + format(ohData));
++		write("overhead_total: " + format(ohTotal));
++		write("relayed_data: " + relayedData);
++		write("relayed_ctrl: " + relayedCtrl);
++		write("bytes_data: " + bytesData);
++		write("bytes_ctrl: " + bytesCtrl);
++		write("latency_avg: " + getAverage(latencies));
++		write("latency_med: " + getMedian(latencies));
++		write("hopcount_avg: " + getIntAverage(hopCounts));
++		write("absorbed_by_malicious: " + format(absorbed));
++		super.done();
++	}
++}
+diff --git a/src/routing/BlackholeEpidemicRouter.java b/src/routing/BlackholeEpidemicRouter.java
+new file mode 100644
+index 0000000..2f6e20b
+--- /dev/null
++++ b/src/routing/BlackholeEpidemicRouter.java
+@@ -0,0 +1,41 @@
++package routing;
++
++import java.util.HashSet;
++import java.util.Set;
++
++import core.DTNHost;
++import core.Message;
++import core.Settings;
++
++/** Epidemic node that accepts data messages from neighbours and drops them. */
++public class BlackholeEpidemicRouter extends EpidemicRouter {
++
++    public BlackholeEpidemicRouter(Settings s) { super(s); }
++
++    protected BlackholeEpidemicRouter(BlackholeEpidemicRouter proto) {
++        super(proto);
++    }
++
++    @Override
++    public BlackholeEpidemicRouter replicate() {
++        return new BlackholeEpidemicRouter(this);
++    }
++
++    private final Set<String> swallowed = new HashSet<String>();
++
++    @Override
++    protected int checkReceiving(Message m, DTNHost from) {
++        if (swallowed.contains(m.getId())) return DENIED_OLD;
++        return super.checkReceiving(m, from);
++    }
++
++    @Override
++    public Message messageTransferred(String id, DTNHost from) {
++        Message m = super.messageTransferred(id, from);
++        if (m != null && m.getTo() != getHost() && hasMessage(id)) {
++            swallowed.add(id);
++            deleteMessage(id, true);
++        }
++        return m;
++    }
++}
+diff --git a/src/routing/PoDCRouter.java b/src/routing/PoDCRouter.java
+index 0d4e522..2c3e18f 100644
+--- a/src/routing/PoDCRouter.java
++++ b/src/routing/PoDCRouter.java
+@@ -1,16 +1,16 @@
+ package routing;
+ 
+-import java.nio.charset.StandardCharsets;
+-import java.security.GeneralSecurityException;
+ import java.security.KeyPair;
+ import java.security.KeyPairGenerator;
++import java.security.GeneralSecurityException;
+ import java.security.PrivateKey;
+-import java.security.Signature;
++import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Random;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+-import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import javax.crypto.spec.SecretKeySpec;
+ 
+@@ -30,521 +30,409 @@ import routing.podc.ProofEntry;
+ import routing.util.RoutingInfo;
+ 
+ /**
+- * Proof-of-Delivery-Chain router — reputation-filtered epidemic
+- * with Ed25519-signed proof chains.
++ * Proof-of-Delivery-Chain router: reputation-filtered epidemic forwarding
++ * with Ed25519-signed proof chains and locally verified reputation.
+  *
+- * <h3>Routing strategy</h3>
+- * <ul>
+- *   <li><b>Data messages</b> use epidemic-style replication with
+- *       a lightweight Score filter that excludes only nodes whose
+- *       reputation falls significantly below the sender's.</li>
+- *   <li><b>ACK messages</b> are forwarded without score filtering
+- *       to ensure timely work crediting.</li>
+- * </ul>
++ * <h3>Reputation</h3>
++ * Every node keeps its own ledger. When a node receives an ACK it verifies
++ * the chain itself and credits the relays listed in it (never the source or
++ * the destination): the relay at position i from the destination receives
++ * 1/(i+1). Accumulated work decays continuously,
++ * W(t) = sum_k c_k exp(-lambda (t - t_k)), where t_k is the delivery time
++ * signed by the destination. No node reads or writes another node's state.
+  *
+- * <h3>Score formula</h3>
+- * {@code Score(X) = alpha * Work(X) + beta * Connectivity(X)}
++ * <h3>Score</h3>
++ * {@code Score(X) = alpha * W(X) + beta * Connectivity(X)}, where W(X) is
++ * taken from the observer's own ledger and Connectivity(X) is the value X
++ * announces in its hello beacon (current neighbours / maximum seen).
+  *
+- * <h3>Settings (namespace {@code Group.PoDCRouter.*})</h3>
+- * <table>
+- *   <tr><td>alpha</td>          <td>weight of Work in Score (0.7)</td></tr>
+- *   <tr><td>beta</td>           <td>weight of Connectivity (0.3)</td></tr>
+- *   <tr><td>decayLambda</td>    <td>exponential decay for work credits (0.01)</td></tr>
+- *   <tr><td>dropThreshold</td>  <td>fractional score drop for exclusion (0.5)</td></tr>
+- * </table>
++ * <h3>Settings (namespace {@code PoDCRouter})</h3>
++ * alpha (0.7), beta (0.3), decayLambda (0.001 1/s), dropThreshold (0.5),
++ * normalizeWork (true: W divided by the largest W in the local ledger),
++ * ackBudget (10 ACKs per contact, 0 = unlimited; data always goes first),
++ * minContribution (0 = off; strict mode threshold on normalized W),
++ * matureLedger (5), explore (0.1).
+  */
+ public class PoDCRouter extends ActiveRouter {
+ 
+-    // ── static lifecycle ──────────────────────────────────────────────
+     static { DTNSim.registerForReset(PoDCRouter.class.getCanonicalName()); }
+ 
+-    private static final Set<String> PROCESSED_ACK_KEYS =
+-            ConcurrentHashMap.newKeySet();
+-    private static final AtomicBoolean END_FLUSHED =
+-            new AtomicBoolean(false);
+-
+     public static void reset() {
+-        PROCESSED_ACK_KEYS.clear();
+-        END_FLUSHED.set(false);
+         ADDRESS_BOOK.clear();
+         PoDCMetrics.get().reset();
+     }
+ 
+-    // ── constants / setting keys ─────────────────────────────────────
+     public static final String SETTINGS_NS       = "PoDCRouter";
+     public static final String ALPHA_S           = "alpha";
+     public static final String BETA_S            = "beta";
+     public static final String DECAY_LAMBDA_S    = "decayLambda";
+     public static final String DROP_THRESHOLD_S  = "dropThreshold";
+ 
+-    private static final String ACK_PREFIX = "PoDC_ACK_";
+-    private static final int    ACK_SIZE   = 64;
+-
+-    public static final String PROP_IS_ACK      = "podc_isAck";
++    public static final String ACK_PREFIX = "PoDC_ACK_";
++    public static final String PROP_IS_ACK       = "podc_isAck";
+     public static final String PROP_ACK_PAYLOAD  = "podc_ackPayload";
+-
+-    // ── per-instance config (immutable) ──────────────────────────────
+-    private final double alpha, beta, decayLambda;
+-    private final double dropThreshold;
+-
+-    // ── Ed25519 key pair (unique per node) ───────────────────────────
+-    private final PrivateKey ed25519Private;
+-    private final byte[]     ed25519PublicEncoded;
+-
+-    // ── X25519 key pair for E2E encryption ─────────────────────────
+-    private final PrivateKey x25519Private;
+-    private final byte[]     x25519PublicEncoded;
++    public static final String PROP_E2E_CIPHERTEXT  = "podc_e2e_ct";
++    public static final String PROP_E2E_SENDER_PUB  = "podc_e2e_senderPub";
+ 
+     /**
+-     * Address book: host name -> X25519 public key.
+-     * In PoDC the public key <b>is</b> the node identity/address —
+-     * every node registers once at init, like a wallet address in crypto.
+-     * This is NOT a trusted third party; it simply models the fact that
+-     * public keys are public (derivable from a known address).
++     * Public identity of each host: Ed25519 fingerprint (the address) and
++     * X25519 key for payload encryption. Senders are assumed to know the
++     * public identity of the destination, as with a wallet address.
+      */
+-    private static final Map<String, byte[]> ADDRESS_BOOK =
++    private static final Map<String, String[]> ADDRESS_BOOK =
++            new ConcurrentHashMap<String, String[]>();
++    private static final Map<String, byte[]> X25519_BOOK =
+             new ConcurrentHashMap<String, byte[]>();
+ 
+-    public static final String PROP_E2E_CIPHERTEXT  = "podc_e2e_ct";
+-    public static final String PROP_E2E_SENDER_PUB  = "podc_e2e_senderPub";
+-    public static final String PROP_E2E_DECRYPTED   = "podc_e2e_plain";
+-
+-    // ── per-instance mutable state ───────────────────────────────────
+-    private double work;
+-    private int    maxNeighborsSeen;
+-    private long   ackTransfersReceived;
+-    private int    nodeDataForwards;
+-    private int    deliveryContributions;
++    protected final double alpha, beta, decayLambda, dropThreshold;
++    protected final boolean normalizeWork;
++    protected final int ackBudget;
++    private final Map<Connection, Integer> acksSentOnContact =
++            new HashMap<Connection, Integer>();
++    private double maxCache, maxCacheTime = -1;
++    protected final double minContribution, explore;
++    protected final int matureLedger;
++    private final Map<Connection, Boolean> exploreOnContact =
++            new HashMap<Connection, Boolean>();
++    private final Random exploreRng = new Random(1);
+ 
+-    private final Map<String, AckMessage> pendingAcks =
+-            new ConcurrentHashMap<String, AckMessage>();
+-    private final Set<String> ackIssuedIds =
+-            ConcurrentHashMap.newKeySet();
++    private final PrivateKey ed25519Private;
++    private final byte[]     ed25519Public;
++    private final String     myId;
++    private final PrivateKey x25519Private;
++    private final byte[]     x25519Public;
+ 
+-    // ── constructors ─────────────────────────────────────────────────
++    /** Local ledger: identity -> {work at time t, t}. */
++    private final Map<String, double[]> ledger = new HashMap<String, double[]>();
++    private final Set<String> processedAcks = new HashSet<String>();
++    private final Set<String> ackIssuedIds = new HashSet<String>();
++    private int maxNeighborsSeen;
++    private int nodeDataForwards;
++    private final Random payloadRng = new Random();
+ 
+     public PoDCRouter(Settings s) {
+         super(s);
+-        String p = SETTINGS_NS + ".";
+-        alpha          = s.getDouble(p + ALPHA_S,          0.7);
+-        beta           = s.getDouble(p + BETA_S,           0.3);
+-        decayLambda    = s.getDouble(p + DECAY_LAMBDA_S,   0.01);
+-        dropThreshold  = s.getDouble(p + DROP_THRESHOLD_S, 0.5);
+-
+-        KeyPair kp = generateEd25519KeyPair();
+-        ed25519Private       = kp.getPrivate();
+-        ed25519PublicEncoded = kp.getPublic().getEncoded();
+-        KeyPair xkp = E2ECrypto.generateKeyPair();
+-        x25519Private       = xkp.getPrivate();
+-        x25519PublicEncoded = xkp.getPublic().getEncoded();
+-        initState();
++        Settings ps = new Settings(SETTINGS_NS);
++        alpha         = ps.getDouble(ALPHA_S, 0.7);
++        beta          = ps.getDouble(BETA_S, 0.3);
++        decayLambda   = ps.getDouble(DECAY_LAMBDA_S, 0.001);
++        dropThreshold = ps.getDouble(DROP_THRESHOLD_S, 0.5);
++        normalizeWork = ps.getBoolean("normalizeWork", true);
++        ackBudget     = ps.getInt("ackBudget", 10);
++        minContribution = ps.getDouble("minContribution", 0);
++        matureLedger  = ps.getInt("matureLedger", 5);
++        explore       = ps.getDouble("explore", 0.1);
++        ed25519Private = null; ed25519Public = null; myId = null;
++        x25519Private = null; x25519Public = null;
+     }
+ 
+     protected PoDCRouter(PoDCRouter proto) {
+         super(proto);
+-        alpha          = proto.alpha;
+-        beta           = proto.beta;
+-        decayLambda    = proto.decayLambda;
+-        dropThreshold  = proto.dropThreshold;
+-
+-        KeyPair kp = generateEd25519KeyPair();
+-        ed25519Private       = kp.getPrivate();
+-        ed25519PublicEncoded = kp.getPublic().getEncoded();
++        alpha         = proto.alpha;
++        beta          = proto.beta;
++        decayLambda   = proto.decayLambda;
++        dropThreshold = proto.dropThreshold;
++        normalizeWork = proto.normalizeWork;
++        ackBudget     = proto.ackBudget;
++        minContribution = proto.minContribution;
++        matureLedger  = proto.matureLedger;
++        explore       = proto.explore;
++        KeyPair kp = newEd25519();
++        ed25519Private = kp.getPrivate();
++        ed25519Public  = kp.getPublic().getEncoded();
++        myId = ProofEntry.fingerprint(ed25519Public);
+         KeyPair xkp = E2ECrypto.generateKeyPair();
+-        x25519Private       = xkp.getPrivate();
+-        x25519PublicEncoded = xkp.getPublic().getEncoded();
+-        initState();
+-    }
+-
+-    private void initState() {
+-        work = 0;
+-        maxNeighborsSeen = 0;
+-        ackTransfersReceived = 0;
+-        nodeDataForwards = 0;
+-        deliveryContributions = 0;
++        x25519Private = xkp.getPrivate();
++        x25519Public  = xkp.getPublic().getEncoded();
+     }
+ 
+     @Override
+     public PoDCRouter replicate() { return new PoDCRouter(this); }
+ 
+-    // ── message creation ─────────────────────────────────────────────
++    protected static KeyPair newEd25519() {
++        try {
++            return KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
++        } catch (GeneralSecurityException e) {
++            throw new AssertionError("Ed25519 unavailable", e);
++        }
++    }
+ 
+     @Override
+-    public boolean createNewMessage(Message m) {
+-        if (!isAck(m)) encryptPayload(m);
+-        boolean ok = super.createNewMessage(m);
+-        if (ok && !isAck(m)) {
+-            PoDCMetrics.get().recordCreated();
+-        }
+-        return ok;
++    public void init(DTNHost host, List<MessageListener> mListeners) {
++        super.init(host, mListeners);
++        ADDRESS_BOOK.put(host.toString(), new String[]{myId});
++        X25519_BOOK.put(host.toString(), x25519Public);
++        PoDCMetrics.get().register(myId, this);
+     }
+ 
+-    // ── E2E encryption (X25519 + AES-256-GCM) ────────────────────────
++    public String getNodeId() { return myId; }
+ 
+-    private void encryptPayload(Message m) {
+-        DTNHost recipient = m.getTo();
+-        if (recipient == null) return;
+-        byte[] recipientPub = ADDRESS_BOOK.get(recipient.toString());
+-        if (recipientPub == null) return;
++    // ── reputation ledger ────────────────────────────────────────────
+ 
+-        String plain = "FROM:" + getHost() + "|TO:" + recipient
+-                + "|ID:" + m.getId()
+-                + "|T:" + String.format("%.0f", SimClock.getTime());
+-        SecretKeySpec key = E2ECrypto.deriveKey(x25519Private, recipientPub);
+-        byte[] ct = E2ECrypto.encrypt(key, plain.getBytes(StandardCharsets.UTF_8));
+-        m.updateProperty(PROP_E2E_CIPHERTEXT, ct);
+-        m.updateProperty(PROP_E2E_SENDER_PUB, x25519PublicEncoded);
++    public double observedWork(String id) {
++        double[] e = ledger.get(id);
++        if (e == null) return 0;
++        return e[0] * Math.exp(-decayLambda * (SimClock.getTime() - e[1]));
+     }
+ 
+-    private String tryDecrypt(Message m) {
+-        Object ctObj = m.getProperty(PROP_E2E_CIPHERTEXT);
+-        Object spObj = m.getProperty(PROP_E2E_SENDER_PUB);
+-        if (!(ctObj instanceof byte[]) || !(spObj instanceof byte[]))
+-            return null;
+-        SecretKeySpec key = E2ECrypto.deriveKey(x25519Private, (byte[]) spObj);
+-        byte[] plain = E2ECrypto.decrypt(key, (byte[]) ctObj);
+-        return plain != null ? new String(plain, StandardCharsets.UTF_8) : null;
++    private void credit(String id, double c, double tDelivery) {
++        double now = SimClock.getTime();
++        double add = c * Math.exp(-decayLambda * Math.max(0, now - tDelivery));
++        ledger.put(id, new double[]{observedWork(id) + add, now});
+     }
+ 
+-    // ── Ed25519 utilities ────────────────────────────────────────────
++    /** Verifies an ACK locally and credits the relays it lists. */
++    protected void processAck(AckMessage ack) {
++        if (!processedAcks.add(ack.key())) return;
++        if (ack.getTimestamp() > SimClock.getTime() + 1 || !ack.verifyChain()) {
++            PoDCMetrics.get().recordInvalidAck();
++            return;
++        }
++        PoDCMetrics.get().recordAckProcessed();
++        List<String> relays = ack.relaysFromDestination();
++        for (int i = 0; i < relays.size(); i++) {
++            credit(relays.get(i), 1.0 / (i + 1), ack.getTimestamp());
++        }
++    }
+ 
+-    private static KeyPair generateEd25519KeyPair() {
+-        try {
+-            return KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+-        } catch (GeneralSecurityException e) {
+-            throw new AssertionError("Ed25519 unavailable", e);
++    /** Connectivity announced in this node's hello beacon. */
++    public double advertisedConnectivity() {
++        int n = getHost().getConnections().size();
++        return maxNeighborsSeen > 0
++                ? Math.min(1.0, (double) n / maxNeighborsSeen)
++                : Math.min(1.0, n / 10.0);
++    }
++
++    /** Largest work in the local ledger, used to normalize W to [0, 1]. */
++    private double maxObservedWork() {
++        double now = SimClock.getTime();
++        if (now != maxCacheTime) {
++            double m = 0;
++            for (double[] e : ledger.values()) {
++                m = Math.max(m, e[0] * Math.exp(-decayLambda * (now - e[1])));
++            }
++            maxCache = m;
++            maxCacheTime = now;
+         }
++        return maxCache;
+     }
+ 
+-    private static final boolean FAST_CRYPTO =
+-            Boolean.getBoolean("podc.fastCrypto");
++    public double normalizedWork(String id) {
++        if (!normalizeWork) return observedWork(id);
++        double m = maxObservedWork();
++        return m > 0 ? observedWork(id) / m : 0;
++    }
+ 
+-    protected byte[] sign(String data) {
+-        if (FAST_CRYPTO) return new byte[64];
+-        try {
+-            Signature signer = Signature.getInstance("Ed25519");
+-            signer.initSign(ed25519Private);
+-            signer.update(data.getBytes(StandardCharsets.UTF_8));
+-            return signer.sign();
+-        } catch (GeneralSecurityException e) {
+-            return new byte[0];
++    /** Score of a node as seen by this node. */
++    public double scoreOf(DTNHost node) {
++        MessageRouter r = node.getRouter();
++        if (!(r instanceof PoDCRouter)) return 0;
++        PoDCRouter pr = (PoDCRouter) r;
++        return alpha * normalizedWork(pr.getNodeId())
++             + beta * pr.advertisedConnectivity();
++    }
++
++    private int contributorsKnown() {
++        double now = SimClock.getTime();
++        int n = 0;
++        for (double[] e : ledger.values()) {
++            if (e[0] * Math.exp(-decayLambda * (now - e[1])) > 0) n++;
+         }
++        return n;
+     }
+ 
+-    protected byte[] getEd25519PublicEncoded() {
+-        return ed25519PublicEncoded;
++    /**
++     * A neighbour is excluded from relaying data if its score is far below
++     * this node's own, or if this node's ledger is mature and the neighbour
++     * has no confirmed contribution. In the latter case a contact is still
++     * admitted with probability {@code explore}, decided once per contact,
++     * so that new nodes can earn reputation.
++     */
++    protected boolean blocked(Connection con) {
++        DTNHost neighbor = con.getOtherNode(getHost());
++        double my = scoreOf(getHost());
++        if (my > 0 && scoreOf(neighbor) < my * (1.0 - dropThreshold)) {
++            return true;
++        }
++        MessageRouter r = neighbor.getRouter();
++        if (minContribution <= 0 || !(r instanceof PoDCRouter)) return false;
++        if (contributorsKnown() < matureLedger) return false;
++        if (normalizedWork(((PoDCRouter) r).getNodeId()) >= minContribution) {
++            return false;
++        }
++        Boolean admit = exploreOnContact.get(con);
++        if (admit == null) {
++            admit = exploreRng.nextDouble() < explore;
++            exploreOnContact.put(con, admit);
++        }
++        return !admit;
+     }
+ 
+-    // ── proof chain ──────────────────────────────────────────────────
++    // ── messages ─────────────────────────────────────────────────────
++
++    @Override
++    public boolean createNewMessage(Message m) {
++        if (!isAck(m)) encryptPayload(m);
++        boolean ok = super.createNewMessage(m);
++        if (ok && !isAck(m)) PoDCMetrics.get().recordCreated();
++        return ok;
++    }
++
++    private void encryptPayload(Message m) {
++        byte[] recipientPub = X25519_BOOK.get(m.getTo().toString());
++        if (recipientPub == null) return;
++        byte[] payload = new byte[m.getSize()];
++        payloadRng.nextBytes(payload);
++        SecretKeySpec key = E2ECrypto.deriveKey(x25519Private, recipientPub);
++        m.updateProperty(PROP_E2E_CIPHERTEXT, E2ECrypto.encrypt(key, payload));
++        m.updateProperty(PROP_E2E_SENDER_PUB, x25519Public);
++    }
++
++    private boolean decryptPayload(Message m) {
++        Object ct = m.getProperty(PROP_E2E_CIPHERTEXT);
++        Object sp = m.getProperty(PROP_E2E_SENDER_PUB);
++        if (!(ct instanceof byte[]) || !(sp instanceof byte[])) return false;
++        SecretKeySpec key = E2ECrypto.deriveKey(x25519Private, (byte[]) sp);
++        return E2ECrypto.decrypt(key, (byte[]) ct) != null;
++    }
+ 
+     protected void addProofToMessage(Message msg) {
+-        String id = getHost().toString();
+-        if (msg.getProofLength() > 0
+-                && msg.getRouteProof().get(msg.getProofLength() - 1)
+-                       .getNodeId().equals(id)) {
++        List<ProofEntry> proof = msg.getRouteProof();
++        if (!proof.isEmpty()
++                && proof.get(proof.size() - 1).getNodeId().equals(myId)) {
+             return;
+         }
+-        long   ts  = (long) SimClock.getTime();
+-        String prev = msg.getProofLength() == 0
+-                ? "0"
+-                : msg.getRouteProof().get(msg.getProofLength() - 1)
+-                      .computeHash();
+-        String dataToSign = id + "|" + ts + "|" + prev;
+-        byte[] sig = sign(dataToSign);
+-        msg.addProof(new ProofEntry(id, ts, prev, sig, ed25519PublicEncoded));
++        String prev;
++        if (proof.isEmpty()) {
++            String[] dst = ADDRESS_BOOK.get(msg.getTo().toString());
++            prev = ProofEntry.genesis(msg.getId(), myId,
++                    dst != null ? dst[0] : "");
++        } else {
++            prev = proof.get(proof.size() - 1).computeHash();
++        }
++        msg.addProof(ProofEntry.create((long) SimClock.getTime(), prev,
++                ed25519Private, ed25519Public));
+     }
+ 
+-    // ── transfer ─────────────────────────────────────────────────────
+-
+     @Override
+     protected int startTransfer(Message m, Connection con) {
+         if (!isAck(m)) addProofToMessage(m);
+         int ret = super.startTransfer(m, con);
+-        if (ret == RCV_OK) {
+-            PoDCMetrics.get().recordForwarded();
+-            if (!isAck(m)) {
+-                nodeDataForwards++;
+-                PoDCMetrics.get().recordForwardEvent(
+-                        SimClock.getTime(), work);
+-            }
++        if (ret == RCV_OK && !isAck(m)) {
++            nodeDataForwards++;
++            PoDCMetrics.get().recordDataForward(SimClock.getTime(),
++                    con.getOtherNode(getHost()));
+         }
+         return ret;
+     }
+ 
+-    // ── ACK creation ─────────────────────────────────────────────────
+-
+-    private void sendAck(Message delivered) {
+-        long now = (long) SimClock.getTime();
+-        AckMessage ack = AckMessage.fromDeliveredMessage(
+-                delivered, now, ed25519Private, ed25519PublicEncoded);
+-        pendingAcks.put(ack.getOriginalMessageId(), ack);
+-
++    private void issueAck(Message delivered) {
++        AckMessage ack = AckMessage.issue(delivered.getId(),
++                delivered.getRouteProof(), (long) SimClock.getTime(),
++                ed25519Private, ed25519Public);
++        processAck(ack);
+         Message m = new Message(getHost(), delivered.getFrom(),
+-                ACK_PREFIX + delivered.getId(), ACK_SIZE);
+-        m.updateProperty(PROP_IS_ACK,      Boolean.TRUE);
+-        m.updateProperty(PROP_ACK_PAYLOAD,  ack);
++                ACK_PREFIX + delivered.getId(), ack.sizeBytes());
++        m.updateProperty(PROP_IS_ACK, Boolean.TRUE);
++        m.updateProperty(PROP_ACK_PAYLOAD, ack);
+         createNewMessage(m);
+     }
+ 
+-    // ── message received ─────────────────────────────────────────────
+-
+     @Override
+     public Message messageTransferred(String id, DTNHost from) {
+         Message m = super.messageTransferred(id, from);
+         if (m == null) return null;
+-
+         if (isAck(m)) {
+-            ackTransfersReceived++;
+-            processAck(m);
+-        } else if (m.getTo() == getHost()) {
+-            if (ackIssuedIds.add(m.getId())) {
+-                String decrypted = tryDecrypt(m);
+-                if (decrypted != null) {
+-                    m.updateProperty(PROP_E2E_DECRYPTED, decrypted);
+-                }
+-                double latency = SimClock.getTime() - m.getCreationTime();
+-                PoDCMetrics.get().recordDelivered(
+-                        latency, m.getProofLength(), m.getProofSizeEstimate());
+-                for (routing.podc.ProofEntry pe : m.getRouteProof()) {
+-                    DTNHost relay = resolveHost(pe.getNodeId());
+-                    if (relay != null) {
+-                        MessageRouter rr = relay.getRouter();
+-                        if (rr instanceof PoDCRouter) {
+-                            ((PoDCRouter) rr).deliveryContributions++;
+-                        }
+-                    }
+-                }
+-                sendAck(m);
+-            }
++            Object raw = m.getProperty(PROP_ACK_PAYLOAD);
++            if (raw instanceof AckMessage) processAck((AckMessage) raw);
++        } else if (m.getTo() == getHost() && ackIssuedIds.add(m.getId())) {
++            PoDCMetrics.get().recordDelivered(
++                    SimClock.getTime() - m.getCreationTime(),
++                    m.getProofLength(), m.getProofSizeEstimate(),
++                    decryptPayload(m), m.getRouteProof());
++            issueAck(m);
+         }
+         return m;
+     }
+ 
+-    // ── ACK processing & work credits ────────────────────────────────
+-
+-    protected void processAck(Message ackMsg) {
+-        Object raw = ackMsg.getProperty(PROP_ACK_PAYLOAD);
+-        if (!(raw instanceof AckMessage)) return;
+-        AckMessage ack = (AckMessage) raw;
++    // ── forwarding ───────────────────────────────────────────────────
+ 
+-        String key = ack.getOriginalMessageId() + ":" + ack.getTimestamp();
+-        if (!PROCESSED_ACK_KEYS.add(key)) return;
+-
+-        if (!ack.verifyChain()) {
+-            PoDCMetrics.get().recordInvalidAck();
+-            PROCESSED_ACK_KEYS.remove(key);
+-            return;
+-        }
+-
+-        PoDCMetrics.get().recordAckProcessed();
+-        pendingAcks.remove(ack.getOriginalMessageId());
+-
+-        List<ProofEntry> path = ack.getConfirmationPath();
+-        for (int i = 0; i < path.size(); i++) {
+-            DTNHost host = resolveHost(path.get(i).getNodeId());
+-            if (host == null) continue;
+-            applyWork(host, computeContribution(i, ack.getTimestamp()));
+-        }
+-    }
+-
+-    public double computeContribution(int indexFromReceiver, long ackTs) {
+-        double pw    = 1.0 / (indexFromReceiver + 1);
+-        double delta = SimClock.getTime() - ackTs;
+-        return pw * Math.exp(-decayLambda * delta);
+-    }
+-
+-    private void applyWork(DTNHost host, double delta) {
+-        MessageRouter r = host.getRouter();
+-        if (r instanceof PoDCRouter && delta > 0 && !Double.isNaN(delta)) {
+-            ((PoDCRouter) r).work += delta;
+-        }
+-    }
+-
+-    // ── score ────────────────────────────────────────────────────────
+-
+-    /**
+-     * {@code Score(X) = alpha * Work(X) + beta * Connectivity(X)}.
+-     */
+-    public double getScoreForNode(DTNHost node) {
+-        if (node == null) return 0;
+-        MessageRouter r = node.getRouter();
+-        if (r instanceof PoDCRouter) {
+-            PoDCRouter pr = (PoDCRouter) r;
+-            return alpha * pr.work + beta * pr.connectivity();
+-        }
+-        return 0;
+-    }
+-
+-    public double getConnectivity() {
+-        return connectivity();
+-    }
+-
+-    double connectivity() {
+-        int n = getHost().getConnections().size();
+-        return maxNeighborsSeen > 0
+-                ? Math.min(1.0, (double) n / maxNeighborsSeen)
+-                : Math.min(1.0, n / 10.0);
+-    }
+-
+-    // ── forwarding decision ──────────────────────────────────────────
+-
+-    protected boolean shouldForward(Message msg, DTNHost neighbor) {
+-        double myScore = getScoreForNode(getHost());
+-        if (myScore <= 0) return true;
+-        return getScoreForNode(neighbor) >= myScore * (1.0 - dropThreshold);
++    @Override
++    public void update() {
++        super.update();
++        PoDCMetrics.get().tick();
++        if (isTransferring() || !canStartTransfer()) return;
++        if (exchangeDeliverableMessages() != null) return;
++        tryAllMessagesToAllConnections();
+     }
+ 
+-    // ── main update loop ─────────────────────────────────────────────
+-
+     @Override
+     public void changedConnection(Connection con) {
+         super.changedConnection(con);
+         int n = getConnections().size();
+         if (n > maxNeighborsSeen) maxNeighborsSeen = n;
++        if (!con.isUp()) {
++            acksSentOnContact.remove(con);
++            exploreOnContact.remove(con);
++        }
+     }
+ 
+-    @Override
+-    public void init(DTNHost host, List<MessageListener> mListeners) {
+-        super.init(host, mListeners);
+-        int n = getConnections().size();
+-        if (n > maxNeighborsSeen) maxNeighborsSeen = n;
+-        ADDRESS_BOOK.put(host.toString(), x25519PublicEncoded);
+-    }
+-
+-    @Override
+-    public void update() {
+-        super.update();
+-        flushMetricsOnceAtEnd();
+-
+-        if (isTransferring() || !canStartTransfer()) return;
+-        if (exchangeDeliverableMessages() != null)   return;
+-        tryAllMessagesToAllConnections();
+-    }
+-
++    /** Data first; ACKs only when no data can be sent, at most ackBudget per contact. */
+     @Override
+     protected Message tryAllMessages(Connection con, List<Message> messages) {
+-        DTNHost nb = con.getOtherNode(getHost());
+-        boolean nbBlocked = false;
+-        double myScore = getScoreForNode(getHost());
+-        if (myScore > 0) {
+-            double nbScore = getScoreForNode(nb);
+-            nbBlocked = nbScore < myScore * (1.0 - dropThreshold);
++        if (!blocked(con)) {
++            for (Message m : messages) {
++                if (isAck(m)) continue;
++                int retVal = startTransfer(m, con);
++                if (retVal == RCV_OK) return m;
++                else if (retVal > 0) return null;
++            }
+         }
++        Integer sent = acksSentOnContact.get(con);
++        int used = sent == null ? 0 : sent;
+         for (Message m : messages) {
+-            if (!isAck(m) && nbBlocked) continue;
++            if (!isAck(m)) continue;
++            if (ackBudget > 0 && used >= ackBudget) return null;
+             int retVal = startTransfer(m, con);
+-            if (retVal == RCV_OK) return m;
++            if (retVal == RCV_OK) {
++                acksSentOnContact.put(con, used + 1);
++                return m;
++            }
+             else if (retVal > 0) return null;
+         }
+         return null;
+     }
+ 
+-    // ── helpers ───────────────────────────────────────────────────────
+-
+-    static boolean isAck(Message m) {
++    public static boolean isAck(Message m) {
+         return Boolean.TRUE.equals(m.getProperty(PROP_IS_ACK));
+     }
+ 
+-    private DTNHost resolveHost(String nodeId) {
+-        SimScenario sc = SimScenario.getInstance();
+-        if (sc == null || nodeId == null) return null;
+-        for (DTNHost h : sc.getHosts()) {
+-            if (h.toString().equals(nodeId)) return h;
+-        }
+-        return null;
+-    }
+-
+-    // ── end-of-sim metrics ───────────────────────────────────────────
+-
+-    private void flushMetricsOnceAtEnd() {
+-        SimScenario sc = SimScenario.getInstance();
+-        if (sc == null) return;
+-        if (SimClock.getTime() + 0.001 < sc.getEndTime()) return;
+-        if (END_FLUSHED.compareAndSet(false, true)) {
+-            PoDCMetrics.get().printSummary();
+-            PoDCMetrics.get().flush(sc.getName());
+-        }
+-    }
+-
+-    // ── GUI routing info ─────────────────────────────────────────────
+-
+     @Override
+     public RoutingInfo getRoutingInfo() {
+         RoutingInfo top = super.getRoutingInfo();
+-
+         RoutingInfo podc = new RoutingInfo("--- PoDC Status ---");
+         podc.addMoreInfo(new RoutingInfo(String.format(
+-                "Work = %.5f", work)));
+-        podc.addMoreInfo(new RoutingInfo(String.format(
+-                "Score = %.5f  (alpha=%.1f, beta=%.1f)",
+-                getScoreForNode(getHost()), alpha, beta)));
+-        podc.addMoreInfo(new RoutingInfo(String.format(
+-                "Connectivity = %.3f  (neighbors=%d, max=%d)",
+-                connectivity(),
+-                getHost().getConnections().size(), maxNeighborsSeen)));
+-        podc.addMoreInfo(new RoutingInfo(
+-                "ACKs received = " + ackTransfersReceived
+-              + "  |  pending = " + pendingAcks.size()));
+-        podc.addMoreInfo(new RoutingInfo(
+-                "Forwards = " + nodeDataForwards
+-              + "  |  delivery contributions = " + deliveryContributions));
++                "Own work (local view) = %.5f", observedWork(myId))));
++        podc.addMoreInfo(new RoutingInfo("Ledger entries = " + ledger.size()));
++        podc.addMoreInfo(new RoutingInfo("Forwards = " + nodeDataForwards));
+         top.addMoreInfo(podc);
+-
+-        RoutingInfo msgs = new RoutingInfo(
+-                "--- Messages (" + getNrofMessages() + ") ---");
+-        for (Message m : getMessageCollection()) {
+-            if (isAck(m)) continue;
+-            StringBuilder sb = new StringBuilder();
+-            sb.append(m.getId());
+-
+-            int pl = m.getProofLength();
+-            if (pl > 0) {
+-                sb.append("  [").append(pl).append(" hops: ");
+-                for (int i = 0; i < pl; i++) {
+-                    if (i > 0) sb.append("->");
+-                    sb.append(m.getRouteProof().get(i).getNodeId());
+-                }
+-                sb.append("]");
+-            }
+-
+-            Object ct = m.getProperty(PROP_E2E_CIPHERTEXT);
+-            if (ct instanceof byte[]) {
+-                String plain = tryDecrypt(m);
+-                if (plain != null) {
+-                    sb.append("  E2E:OPEN \"").append(plain).append("\"");
+-                } else {
+-                    sb.append("  E2E:LOCKED (").append(((byte[]) ct).length).append("B)");
+-                }
+-            }
+-            msgs.addMoreInfo(new RoutingInfo(sb.toString()));
+-        }
+-        top.addMoreInfo(msgs);
+-
+-        RoutingInfo neighbors = new RoutingInfo(
+-                "--- Neighbor Scores ---");
+-        for (Connection c : getConnections()) {
+-            DTNHost nb = c.getOtherNode(getHost());
+-            neighbors.addMoreInfo(new RoutingInfo(String.format(
+-                    "%s  score=%.4f%s",
+-                    nb, getScoreForNode(nb),
+-                    shouldForward(null, nb) ? "" : "  [BLOCKED]")));
+-        }
+-        top.addMoreInfo(neighbors);
+-
+         return top;
+     }
+ 
+-    // ── accessors ────────────────────────────────────────────────────
+-
+-    public double getWork()  { return work; }
++    public int getNodeForwards() { return nodeDataForwards; }
++    public String getHostName() { return getHost().toString(); }
+     public double getAlpha() { return alpha; }
+     public double getBeta()  { return beta; }
+-    public int getNodeForwards()          { return nodeDataForwards; }
+-    public int getDeliveryContributions() { return deliveryContributions; }
++
++    protected PrivateKey getEd25519Private() { return ed25519Private; }
++    protected byte[] getEd25519Public() { return ed25519Public; }
++
++    protected static String[] lookupIdentity(String hostName) {
++        return ADDRESS_BOOK.get(hostName);
++    }
+ 
+     @Override
+     public String toString() {
+-        return "PoDCRouter@" + getHost()
+-             + " w=" + String.format("%.3f", work);
++        return "PoDCRouter@" + getHost();
+     }
+ }
+diff --git a/src/routing/SybilPoDCRouter.java b/src/routing/SybilPoDCRouter.java
+index ce52d9f..53b5818 100644
+--- a/src/routing/SybilPoDCRouter.java
++++ b/src/routing/SybilPoDCRouter.java
+@@ -1,83 +1,152 @@
+ package routing;
+ 
++import java.security.KeyPair;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Random;
++import java.util.Set;
++
+ import core.DTNHost;
+ import core.Message;
+ import core.Settings;
+ import core.SimClock;
+ import core.SimScenario;
+ 
++import routing.podc.AckMessage;
+ import routing.podc.ProofEntry;
+ 
+-import java.util.List;
+-import java.util.Random;
+-
+ /**
+- * A malicious PoDC router that tries to inflate its own {@code work}
+- * by injecting forged {@link ProofEntry} records.
+- *
+- * <h3>Attack vector (with Ed25519)</h3>
+- * When forwarding a data message the Sybil node inserts an <b>extra</b>
+- * proof entry with a <em>spoofed</em> node id (picked randomly from the
+- * scenario's host list).  The entry is signed with <em>this</em> node's
+- * Ed25519 private key and carries <em>this</em> node's public key.
++ * Malicious PoDC node.
+  *
+- * <p>Because {@link ProofEntry#verify()} only checks that the signature
+- * matches the embedded public key (no global PKI), the forged entry
+- * passes cryptographic verification.  However, the public key does
+- * <b>not</b> belong to the claimed {@code nodeId}, so a system with
+- * identity-binding checks would detect the forgery.</p>
++ * <ul>
++ *   <li><b>blackhole</b>: accepts data messages from neighbours and
++ *       silently drops them.</li>
++ *   <li><b>self-promotion</b>: every {@code fakeAckInterval} seconds until
++ *       {@code attackStop} it fabricates a proof of delivery between two of
++ *       its own Sybil identities in which its real identity is the only
++ *       relay, so honest verifiers credit it with 1. All signatures are
++ *       valid, so the fake ACK passes verification.</li>
++ *   <li>while promoting, it announces maximal connectivity in hello.</li>
++ *   <li><b>spoofIdentity</b>: the relay entry of the fake ACK claims the
++ *       identity of a random honest node but is signed with the attacker's
++ *       key (the attack of the first PoDC version).</li>
++ * </ul>
++ * Settings namespace {@code SybilPoDCRouter}: blackhole (true),
++ * fakeAckInterval (0 = off), attackStop (end of simulation),
++ * spoofIdentity (false).
+  */
+ public class SybilPoDCRouter extends PoDCRouter {
+ 
+-    private final Random rng = new Random();
++    private final boolean blackhole, spoofIdentity;
++    private final double fakeAckInterval, attackStop;
++    private KeyPair sybilA, sybilB;
++    private double nextFake;
++    private int fakeCount;
++    private final Random rng = new Random(7);
++
++    public SybilPoDCRouter(Settings s) {
++        super(s);
++        Settings ss = new Settings("SybilPoDCRouter");
++        blackhole = ss.getBoolean("blackhole", true);
++        spoofIdentity = ss.getBoolean("spoofIdentity", false);
++        fakeAckInterval = ss.getDouble("fakeAckInterval", 0);
++        attackStop = ss.getDouble("attackStop", Double.MAX_VALUE);
++    }
++
++    protected SybilPoDCRouter(SybilPoDCRouter proto) {
++        super(proto);
++        blackhole = proto.blackhole;
++        spoofIdentity = proto.spoofIdentity;
++        fakeAckInterval = proto.fakeAckInterval;
++        attackStop = proto.attackStop;
++        sybilA = newEd25519();
++        sybilB = newEd25519();
++    }
++
++    @Override
++    public SybilPoDCRouter replicate() { return new SybilPoDCRouter(this); }
++
++    private boolean promoting() {
++        return fakeAckInterval > 0 && SimClock.getTime() < attackStop;
++    }
+ 
+-    public SybilPoDCRouter(Settings s) { super(s); }
++    @Override
++    public double advertisedConnectivity() {
++        return promoting() ? 1.0 : super.advertisedConnectivity();
++    }
+ 
+-    protected SybilPoDCRouter(SybilPoDCRouter proto) { super(proto); }
++    private final Set<String> swallowed = new HashSet<String>();
+ 
+     @Override
+-    public SybilPoDCRouter replicate() {
+-        return new SybilPoDCRouter(this);
++    protected int checkReceiving(Message m, DTNHost from) {
++        if (swallowed.contains(m.getId())) return DENIED_OLD;
++        return super.checkReceiving(m, from);
+     }
+ 
+-    /**
+-     * Injects a forged proof entry with a randomly chosen victim node id
+-     * (signed with this Sybil node's own key) <em>before</em> the
+-     * legitimate proof entry for this host.
+-     */
+     @Override
+-    protected void addProofToMessage(Message msg) {
+-        DTNHost victim = pickRandomVictim();
+-        if (victim != null) {
+-            String fakeId = victim.toString();
+-            long ts = (long) SimClock.getTime();
+-            String prev = msg.getProofLength() == 0
+-                    ? "0"
+-                    : msg.getRouteProof()
+-                          .get(msg.getProofLength() - 1).computeHash();
+-            String dataToSign = fakeId + "|" + ts + "|" + prev;
+-            byte[] sig = sign(dataToSign);
+-            msg.addProof(new ProofEntry(
+-                    fakeId, ts, prev, sig, getEd25519PublicEncoded()));
++    public Message messageTransferred(String id, DTNHost from) {
++        Message m = super.messageTransferred(id, from);
++        if (m != null && blackhole && !isAck(m) && m.getTo() != getHost()
++                && hasMessage(id)) {
++            swallowed.add(id);
++            deleteMessage(id, true);
+         }
+-        super.addProofToMessage(msg);
++        return m;
+     }
+ 
+-    private DTNHost pickRandomVictim() {
+-        SimScenario sc = SimScenario.getInstance();
+-        if (sc == null) return null;
+-        List<DTNHost> hosts = sc.getHosts();
+-        if (hosts.size() <= 1) return null;
+-        DTNHost victim;
+-        do {
+-            victim = hosts.get(rng.nextInt(hosts.size()));
+-        } while (victim == getHost());
+-        return victim;
++    @Override
++    public void update() {
++        if (promoting() && SimClock.getTime() >= nextFake) {
++            nextFake = SimClock.getTime() + fakeAckInterval;
++            injectFakeAck();
++        }
++        super.update();
++    }
++
++    private void injectFakeAck() {
++        long ts = (long) SimClock.getTime();
++        String msgId = "SYB_" + getHost() + "_" + (fakeCount++);
++        byte[] pa = sybilA.getPublic().getEncoded();
++        byte[] pb = sybilB.getPublic().getEncoded();
++        String ida = ProofEntry.fingerprint(pa);
++        String idb = ProofEntry.fingerprint(pb);
++        ProofEntry e0 = ProofEntry.create(ts,
++                ProofEntry.genesis(msgId, ida, idb), sybilA.getPrivate(), pa);
++        ProofEntry e1;
++        if (spoofIdentity) {
++            String[] victim = lookupIdentity(randomHonestHost().toString());
++            e1 = ProofEntry.spoofed(victim[0], ts, e0.computeHash(),
++                    getEd25519Private(), getEd25519Public());
++        } else {
++            e1 = ProofEntry.create(ts, e0.computeHash(),
++                    getEd25519Private(), getEd25519Public());
++        }
++        ProofEntry e2 = ProofEntry.create(ts, e1.computeHash(),
++                sybilB.getPrivate(), pb);
++        AckMessage ack = new AckMessage(msgId, idb,
++                new ArrayList<ProofEntry>(Arrays.asList(e0, e1, e2)));
++
++        DTNHost target = randomHonestHost();
++        if (target == null) return;
++        Message m = new Message(getHost(), target, ACK_PREFIX + msgId,
++                ack.sizeBytes());
++        m.updateProperty(PROP_IS_ACK, Boolean.TRUE);
++        m.updateProperty(PROP_ACK_PAYLOAD, ack);
++        createNewMessage(m);
++    }
++
++    private DTNHost randomHonestHost() {
++        List<DTNHost> honest = new ArrayList<DTNHost>();
++        for (DTNHost h : SimScenario.getInstance().getHosts()) {
++            if (!(h.getRouter() instanceof SybilPoDCRouter)) honest.add(h);
++        }
++        return honest.isEmpty() ? null : honest.get(rng.nextInt(honest.size()));
+     }
+ 
+     @Override
+     public String toString() {
+-        return "SybilPoDCRouter@" + getHost()
+-             + " w=" + String.format("%.3f", getWork());
++        return "SybilPoDCRouter@" + getHost();
+     }
+ }
+diff --git a/src/routing/podc/AckMessage.java b/src/routing/podc/AckMessage.java
+index 7931027..915ab39 100644
+--- a/src/routing/podc/AckMessage.java
++++ b/src/routing/podc/AckMessage.java
+@@ -1,125 +1,86 @@
+ package routing.podc;
+ 
+-import core.Message;
+-
+-import java.nio.charset.StandardCharsets;
+-import java.security.GeneralSecurityException;
+ import java.security.PrivateKey;
+-import java.security.Signature;
+ import java.util.ArrayList;
+ import java.util.Collections;
++import java.util.LinkedHashSet;
+ import java.util.List;
++import java.util.Set;
+ 
+ /**
+- * Acknowledgement payload carried inside a control {@link Message}.
++ * Proof of delivery issued by the destination of a data message.
+  *
+- * When the final recipient accepts a data message it builds an
+- * {@code AckMessage} via {@link #fromDeliveredMessage}.  The
+- * {@link #confirmationPath} is the delivered message's
+- * {@link Message#getRouteProof()} reversed (receiver → source) with
+- * a freshly computed hash chain.  Each entry in the reverse chain is
+- * signed by the ACK creator (the final recipient) using Ed25519.
++ * The chain is the forward proof chain exactly as it arrived (each entry
++ * signed by the node that forwarded the message) followed by one delivery
++ * entry signed by the destination. Any node can verify the whole chain
++ * from the ACK alone: signatures, identity binding of every entry, hash
++ * links, and the genesis value that ties the chain to the message id,
++ * the source and the destination.
+  */
+ public class AckMessage {
+ 
+     private final String originalMessageId;
+-    private final List<ProofEntry> confirmationPath;
+-    private final long timestamp;
+-
+-    /* ---- factory ---- */
+-
+-    /**
+-     * Reverses the forward proof chain and re-links the hashes.
+-     * Each new entry is signed by the ACK creator's Ed25519 key.
+-     *
+-     * @param delivered       the delivered data message
+-     * @param now             simulation timestamp for the ACK
+-     * @param signerPrivate   Ed25519 private key of the ACK creator
+-     * @param signerPubEncoded X.509-encoded public key of the ACK creator
+-     */
+-    public static AckMessage fromDeliveredMessage(
+-            Message delivered, long now,
+-            PrivateKey signerPrivate, byte[] signerPubEncoded) {
+-        List<ProofEntry> fwd = delivered.getRouteProof();
+-        List<ProofEntry> rev = new ArrayList<ProofEntry>();
+-        String prev = "0";
+-        for (int i = fwd.size() - 1; i >= 0; i--) {
+-            ProofEntry e = fwd.get(i);
+-            String data = e.getNodeId() + "|" + e.getTimestamp() + "|" + prev;
+-            byte[] sig = signData(signerPrivate, data);
+-            ProofEntry step = new ProofEntry(
+-                    e.getNodeId(), e.getTimestamp(), prev,
+-                    sig, signerPubEncoded);
+-            rev.add(step);
+-            prev = step.computeHash();
+-        }
+-        return new AckMessage(delivered.getId(), rev, now);
+-    }
+-
+-    private static final boolean FAST_CRYPTO =
+-            Boolean.getBoolean("podc.fastCrypto");
+-
+-    private static byte[] signData(PrivateKey key, String data) {
+-        if (FAST_CRYPTO) return new byte[64];
+-        try {
+-            Signature signer = Signature.getInstance("Ed25519");
+-            signer.initSign(key);
+-            signer.update(data.getBytes(StandardCharsets.UTF_8));
+-            return signer.sign();
+-        } catch (GeneralSecurityException e) {
+-            return new byte[0];
+-        }
+-    }
++    private final String destinationId;
++    private final List<ProofEntry> chain;
+ 
+-    /* ---- constructors ---- */
+-
+-    public AckMessage(String originalMessageId,
+-                      List<ProofEntry> confirmationPath, long timestamp) {
++    public AckMessage(String originalMessageId, String destinationId,
++                      List<ProofEntry> chain) {
+         this.originalMessageId = originalMessageId;
+-        this.confirmationPath  = confirmationPath != null
+-                ? new ArrayList<ProofEntry>(confirmationPath)
+-                : new ArrayList<ProofEntry>();
+-        this.timestamp = timestamp;
++        this.destinationId = destinationId;
++        this.chain = new ArrayList<ProofEntry>(chain);
+     }
+ 
+-    /* ---- verification ---- */
++    /** Builds the ACK at the destination from the received forward chain. */
++    public static AckMessage issue(String msgId, List<ProofEntry> forward,
++                                   long now, PrivateKey dstPriv,
++                                   byte[] dstPub) {
++        List<ProofEntry> c = new ArrayList<ProofEntry>(forward);
++        String prev = c.get(c.size() - 1).computeHash();
++        c.add(ProofEntry.create(now, prev, dstPriv, dstPub));
++        return new AckMessage(msgId, ProofEntry.fingerprint(dstPub), c);
++    }
+ 
+-    /**
+-     * Validates both structural integrity (hash chain) and cryptographic
+-     * integrity (Ed25519 signature) of every entry in the path.
+-     *
+-     * <ol>
+-     *   <li>First entry's prevHash must be {@code "0"}.</li>
+-     *   <li>Each subsequent entry's prevHash must equal the preceding
+-     *       entry's {@link ProofEntry#computeHash()}.</li>
+-     *   <li>{@link ProofEntry#verify()} must return {@code true} for
+-     *       every entry (Ed25519 signature check).</li>
+-     * </ol>
+-     */
+     public boolean verifyChain() {
+-        List<ProofEntry> path = confirmationPath;
+-        if (path.isEmpty()) return true;
+-        for (int i = 0; i < path.size(); i++) {
+-            ProofEntry e = path.get(i);
+-            if (i == 0) {
+-                if (!"0".equals(e.getPrevHash())) return false;
+-            } else {
+-                if (!e.getPrevHash().equals(path.get(i - 1).computeHash()))
+-                    return false;
+-            }
++        if (chain.size() < 2) return false;
++        ProofEntry first = chain.get(0);
++        String g = ProofEntry.genesis(originalMessageId,
++                first.getNodeId(), destinationId);
++        if (!g.equals(first.getPrevHash())) return false;
++        if (!destinationId.equals(chain.get(chain.size() - 1).getNodeId()))
++            return false;
++        for (int i = 0; i < chain.size(); i++) {
++            ProofEntry e = chain.get(i);
++            if (i > 0 && !e.getPrevHash().equals(chain.get(i - 1).computeHash()))
++                return false;
+             if (!e.verify()) return false;
+         }
+         return true;
+     }
+ 
+-    /* ---- accessors ---- */
+-
+-    public String getOriginalMessageId() { return originalMessageId; }
+-    public long   getTimestamp()         { return timestamp; }
++    /**
++     * Relay identifiers ordered from the destination side (index 0 is the
++     * node that handed the message to the destination). The source and the
++     * destination are excluded, and every identifier appears once.
++     */
++    public List<String> relaysFromDestination() {
++        String src = chain.get(0).getNodeId();
++        Set<String> seen = new LinkedHashSet<String>();
++        for (int i = chain.size() - 2; i >= 1; i--) {
++            String id = chain.get(i).getNodeId();
++            if (!id.equals(src) && !id.equals(destinationId)) seen.add(id);
++        }
++        return new ArrayList<String>(seen);
++    }
+ 
+-    public List<ProofEntry> getConfirmationPath() {
+-        return Collections.unmodifiableList(confirmationPath);
++    /** Unique key of this proof of delivery. */
++    public String key() {
++        return originalMessageId + ":" + chain.get(chain.size() - 1).computeHash();
+     }
+ 
+-    public int getHopCount() { return confirmationPath.size(); }
++    public String getOriginalMessageId() { return originalMessageId; }
++    public String getDestinationId()     { return destinationId; }
++    public String getSourceId()          { return chain.get(0).getNodeId(); }
++    public long   getTimestamp() { return chain.get(chain.size() - 1).getTimestamp(); }
++    public List<ProofEntry> getChain() { return Collections.unmodifiableList(chain); }
++    public int sizeBytes() { return 64 + 128 * chain.size(); }
+ }
+diff --git a/src/routing/podc/PoDCMetrics.java b/src/routing/podc/PoDCMetrics.java
+index 9c3444c..fb2992f 100644
+--- a/src/routing/podc/PoDCMetrics.java
++++ b/src/routing/podc/PoDCMetrics.java
+@@ -4,6 +4,8 @@ import core.DTNHost;
+ import core.SimClock;
+ import core.SimScenario;
+ import routing.MessageRouter;
++import routing.PoDCRouter;
++import routing.SybilPoDCRouter;
+ 
+ import java.io.File;
+ import java.io.FileWriter;
+@@ -11,259 +13,177 @@ import java.io.IOException;
+ import java.io.PrintWriter;
+ import java.util.ArrayList;
+ import java.util.Collections;
++import java.util.HashMap;
+ import java.util.List;
++import java.util.Map;
+ 
+ /**
+- * Collects per-simulation PoDC metrics and writes CSV output when
+- * {@link #flush(String)} is called (typically at the end of the run).
+- *
+- * <p>In addition to aggregate stats, records per-forward-event data
+- * (simulation time, forwarder's work) so that a "natural selection"
+- * chart can be generated post-hoc.</p>
++ * Simulation-wide statistics for PoDC runs. This class only observes;
++ * routing decisions never read from it.
+  */
+ public final class PoDCMetrics {
+ 
+-    /* ---- singleton ---- */
+     private static final PoDCMetrics INSTANCE = new PoDCMetrics();
+     public static PoDCMetrics get() { return INSTANCE; }
+     private PoDCMetrics() { reset(); }
+ 
+-    /* ---- raw accumulators ---- */
+-    private int  created;
+-    private int  delivered;
+-    private long relayed;
+-    private long rejected;
+-    private long acksProcessed;
+-    private long invalidAcks;
++    private static final int BIN = 60;
+ 
+-    private final List<Double>  latencies  = new ArrayList<Double>();
+-    private final List<Integer> hopCounts  = new ArrayList<Integer>();
++    private final Map<String, PoDCRouter> byId = new HashMap<String, PoDCRouter>();
++    private int created, delivered, decrypted;
++    private long acksProcessed, invalidAcks;
++    private final List<Double> latencies = new ArrayList<Double>();
++    private final List<Integer> hops = new ArrayList<Integer>();
+     private final List<Integer> proofBytes = new ArrayList<Integer>();
++    private final List<double[]> series = new ArrayList<double[]>();
++    private int[] binForwards = new int[2];
++    private int lastBin = 0;
++    private boolean flushed;
+ 
+-    private static final int BIN_SIZE = 60;
+-    private final List<int[]> forwardBins = new ArrayList<int[]>();
+-
+-    private int lastGiniBin = -1;
+-    private final List<Double> giniBins = new ArrayList<Double>();
++    public void reset() {
++        byId.clear();
++        created = delivered = decrypted = 0;
++        acksProcessed = invalidAcks = 0;
++        latencies.clear(); hops.clear(); proofBytes.clear();
++        series.clear();
++        binForwards = new int[2];
++        lastBin = 0;
++        flushed = false;
++    }
+ 
+-    /* ---- recording API ---- */
++    public void register(String id, PoDCRouter r) { byId.put(id, r); }
+ 
+-    public void recordCreated()  { created++; }
++    public void recordCreated() { created++; }
++    public void recordAckProcessed() { acksProcessed++; }
++    public void recordInvalidAck() { invalidAcks++; }
+ 
+-    public void recordDelivered(double latency, int hops, int proofSize) {
++    public void recordDelivered(double latency, int nHops, int bytes,
++                                boolean ok, List<ProofEntry> chain) {
+         delivered++;
++        if (ok) decrypted++;
+         latencies.add(latency);
+-        hopCounts.add(hops);
+-        proofBytes.add(proofSize);
+-    }
+-
+-    public void recordForwarded() { relayed++; }
+-    public void recordRejected()  { rejected++; }
+-    public void recordAckProcessed() { acksProcessed++; }
+-    public void recordInvalidAck()   { invalidAcks++; }
+-
+-    /**
+-     * Records a data-message forward event for time-series analysis.
+-     * @param simTime  current simulation time
+-     * @param forwarderWork  the forwarding node's accumulated work
+-     */
+-    public void recordForwardEvent(double simTime, double forwarderWork) {
+-        int bin = (int) (simTime / BIN_SIZE);
+-        while (forwardBins.size() <= bin) {
+-            forwardBins.add(new int[]{0, 0});
+-        }
+-        int[] slot = forwardBins.get(bin);
+-        slot[0]++;
+-        if (forwarderWork > 0) slot[1]++;
+-
+-        if (bin > lastGiniBin) {
+-            lastGiniBin = bin;
+-            while (giniBins.size() <= bin) giniBins.add(0.0);
+-            giniBins.set(bin, giniWork());
+-        }
++        hops.add(nHops);
++        proofBytes.add(bytes);
+     }
+ 
+-    /* ---- computed metrics ---- */
+-
+-    public double deliveryRatio() {
+-        return created == 0 ? 0 : (double) delivered / created;
++    public void recordDataForward(double t, DTNHost to) {
++        binForwards[0]++;
++        if (to.getRouter() instanceof SybilPoDCRouter) binForwards[1]++;
+     }
+ 
+-    public double overheadRatio() {
+-        return delivered == 0 ? Double.NaN
+-                : (double)(relayed - delivered) / delivered;
++    private static boolean isAttacker(PoDCRouter r) {
++        return r instanceof SybilPoDCRouter;
+     }
+ 
+-    public double avgLatency() {
+-        return avg(latencies);
+-    }
+-
+-    public double avgHops() {
+-        double s = 0;
+-        for (int h : hopCounts) s += h;
+-        return hopCounts.isEmpty() ? 0 : s / hopCounts.size();
+-    }
+-
+-    public double avgProofBytes() {
+-        double s = 0;
+-        for (int b : proofBytes) s += b;
+-        return proofBytes.isEmpty() ? 0 : s / proofBytes.size();
+-    }
+-
+-    public double giniWork() {
+-        SimScenario sc = SimScenario.getInstance();
+-        if (sc == null) return 0;
+-        List<Double> works = new ArrayList<Double>();
+-        for (DTNHost h : sc.getHosts()) {
+-            MessageRouter r = h.getRouter();
+-            if (r instanceof routing.PoDCRouter) {
+-                works.add(((routing.PoDCRouter) r).getWork());
++    /**
++     * Mean work of attackers and of honest nodes as seen by honest
++     * observers, and mean score ratio attacker/observer.
++     */
++    private double[] snapshot() {
++        double att = 0, hon = 0;
++        int na = 0, nh = 0;
++        List<PoDCRouter> all = new ArrayList<PoDCRouter>(byId.values());
++        for (PoDCRouter obs : all) {
++            if (isAttacker(obs)) continue;
++            for (PoDCRouter tgt : all) {
++                if (tgt == obs) continue;
++                double w = obs.observedWork(tgt.getNodeId());
++                if (isAttacker(tgt)) { att += w; na++; }
++                else { hon += w; nh++; }
+             }
+         }
+-        return gini(works);
+-    }
+-
+-    /* ---- CSV output ---- */
+-
+-    private static final String HEADER =
+-            "scenario,sim_time,nodes,created,delivered,delivery_ratio,"
+-          + "overhead_ratio,avg_latency,avg_hops,gini_work,"
+-          + "avg_proof_bytes,total_forwarded,total_rejected,"
+-          + "total_acks,total_invalid_acks";
+-
+-    public void flush(String scenarioName) {
+-        String dir = "reports";
+-        new File(dir).mkdirs();
+-
+-        String path = dir + "/podc_results.csv";
+-        boolean needsHeader = !new File(path).exists();
+-        try (PrintWriter pw = new PrintWriter(new FileWriter(path, true))) {
+-            if (needsHeader) pw.println(HEADER);
+-            int nodes = 0;
+-            SimScenario sc = SimScenario.getInstance();
+-            if (sc != null) nodes = sc.getHosts().size();
+-            pw.printf("%s,%.1f,%d,%d,%d,%.6f,%.4f,%.2f,%.2f,%.6f,%.1f,%d,%d,%d,%d%n",
+-                    scenarioName, SimClock.getTime(), nodes,
+-                    created, delivered, deliveryRatio(), overheadRatio(),
+-                    avgLatency(), avgHops(), giniWork(), avgProofBytes(),
+-                    relayed, rejected, acksProcessed, invalidAcks);
+-        } catch (IOException e) {
+-            System.err.println("PoDCMetrics: cannot write CSV — " + e);
++        return new double[]{na > 0 ? att / na : 0, nh > 0 ? hon / nh : 0};
++    }
++
++    /** Called from every router update; samples once per bin. */
++    public void tick() {
++        double t = SimClock.getTime();
++        int bin = (int) (t / BIN);
++        if (bin > lastBin) {
++            double[] s = snapshot();
++            double frac = binForwards[0] > 0
++                    ? (double) binForwards[1] / binForwards[0] : 0;
++            series.add(new double[]{lastBin * BIN, s[0], s[1],
++                    binForwards[0], binForwards[1], frac});
++            binForwards = new int[2];
++            lastBin = bin;
++        }
++        SimScenario sc = SimScenario.getInstance();
++        if (!flushed && sc != null && t + 0.001 >= sc.getEndTime()) {
++            flushed = true;
++            flush(sc.getName());
+         }
+-
+-        flushWorkTimeSeries(scenarioName, dir);
+-        flushGiniTimeSeries(scenarioName, dir);
+-        flushPerMessageData(scenarioName, dir);
+-        flushPerNodeData(scenarioName, dir);
+     }
+ 
+-    /**
+-     * Writes {@code reports/<scenario>_work_timeseries.csv} with columns:
+-     * time_bin_start, total_forwards, experienced_forwards, fraction_experienced
+-     *
+-     * "Experienced" = forwarder had work&gt;0 (i.e. received at least one ACK).
+-     */
+-    private void flushWorkTimeSeries(String scenarioName, String dir) {
+-        String path = dir + "/" + scenarioName + "_work_timeseries.csv";
+-        try (PrintWriter pw = new PrintWriter(new FileWriter(path))) {
+-            pw.println("time,total_forwards,experienced_forwards,fraction_experienced");
+-            for (int i = 0; i < forwardBins.size(); i++) {
+-                int[] slot = forwardBins.get(i);
+-                double frac = slot[0] > 0 ? (double) slot[1] / slot[0] : 0;
+-                pw.printf("%d,%d,%d,%.4f%n",
+-                        i * BIN_SIZE, slot[0], slot[1], frac);
++    /** Gini coefficient of honest nodes' work averaged over observers. */
++    private double giniConsensusWork() {
++        List<PoDCRouter> all = new ArrayList<PoDCRouter>(byId.values());
++        List<Double> w = new ArrayList<Double>();
++        for (PoDCRouter tgt : all) {
++            if (isAttacker(tgt)) continue;
++            double s = 0; int n = 0;
++            for (PoDCRouter obs : all) {
++                if (obs == tgt || isAttacker(obs)) continue;
++                s += obs.observedWork(tgt.getNodeId()); n++;
+             }
+-        } catch (IOException e) {
+-            System.err.println("PoDCMetrics: cannot write timeseries — " + e);
++            w.add(n > 0 ? s / n : 0);
+         }
++        return gini(w);
+     }
+ 
+-    private void flushGiniTimeSeries(String scenarioName, String dir) {
+-        String path = dir + "/" + scenarioName + "_gini_timeseries.csv";
+-        try (PrintWriter pw = new PrintWriter(new FileWriter(path))) {
+-            pw.println("time,gini");
+-            for (int i = 0; i < giniBins.size(); i++) {
+-                pw.printf("%d,%.6f%n", i * BIN_SIZE, giniBins.get(i));
+-            }
++    private void flush(String name) {
++        String dir = "reports/podc";
++        new File(dir).mkdirs();
++        try (PrintWriter pw = new PrintWriter(new FileWriter(dir + "/" + name + "_summary.txt"))) {
++            pw.println("created: " + created);
++            pw.println("delivered: " + delivered);
++            pw.println("decrypted: " + decrypted);
++            pw.println("acks_processed: " + acksProcessed);
++            pw.println("invalid_acks: " + invalidAcks);
++            pw.println("avg_latency: " + avg(latencies));
++            pw.println("avg_proof_hops: " + avgI(hops));
++            pw.println("avg_proof_bytes: " + avgI(proofBytes));
++            pw.println("gini_work: " + giniConsensusWork());
+         } catch (IOException e) {
+-            System.err.println("PoDCMetrics: cannot write gini timeseries — " + e);
++            System.err.println("PoDCMetrics: " + e);
+         }
+-    }
+-
+-    private void flushPerMessageData(String scenarioName, String dir) {
+-        String path = dir + "/" + scenarioName + "_per_message.csv";
+-        try (PrintWriter pw = new PrintWriter(new FileWriter(path))) {
+-            pw.println("latency,hops,proof_bytes");
+-            int n = latencies.size();
+-            for (int i = 0; i < n; i++) {
+-                pw.printf("%.2f,%d,%d%n",
+-                        latencies.get(i),
+-                        i < hopCounts.size() ? hopCounts.get(i) : 0,
+-                        i < proofBytes.size() ? proofBytes.get(i) : 0);
++        try (PrintWriter pw = new PrintWriter(new FileWriter(dir + "/" + name + "_series.csv"))) {
++            pw.println("time,attacker_work,honest_work,forwards,forwards_to_attackers,frac_to_attackers");
++            for (double[] r : series) {
++                pw.printf(java.util.Locale.ROOT, "%.0f,%.6f,%.6f,%.0f,%.0f,%.6f%n",
++                        r[0], r[1], r[2], r[3], r[4], r[5]);
+             }
+         } catch (IOException e) {
+-            System.err.println("PoDCMetrics: cannot write per-message data — " + e);
++            System.err.println("PoDCMetrics: " + e);
+         }
+-    }
+-
+-    public void flushPerNodeData(String scenarioName, String dir) {
+-        SimScenario sc = SimScenario.getInstance();
+-        if (sc == null) return;
+-        String path = dir + "/" + scenarioName + "_per_node.csv";
+-        try (PrintWriter pw = new PrintWriter(new FileWriter(path))) {
+-            pw.println("node_id,work,score,connectivity,forwards,delivery_contributions");
+-            for (DTNHost h : sc.getHosts()) {
+-                MessageRouter r = h.getRouter();
+-                if (r instanceof routing.PoDCRouter) {
+-                    routing.PoDCRouter pr = (routing.PoDCRouter) r;
+-                    pw.printf("%s,%.6f,%.6f,%.4f,%d,%d%n",
+-                            h.toString(),
+-                            pr.getWork(),
+-                            pr.getScoreForNode(h),
+-                            pr.getConnectivity(),
+-                            pr.getNodeForwards(),
+-                            pr.getDeliveryContributions());
++        try (PrintWriter pw = new PrintWriter(new FileWriter(dir + "/" + name + "_per_node.csv"))) {
++            pw.println("host,attacker,consensus_work,forwards");
++            List<PoDCRouter> all = new ArrayList<PoDCRouter>(byId.values());
++            for (PoDCRouter tgt : all) {
++                double s = 0; int n = 0;
++                for (PoDCRouter obs : all) {
++                    if (obs == tgt || isAttacker(obs)) continue;
++                    s += obs.observedWork(tgt.getNodeId()); n++;
+                 }
++                pw.printf(java.util.Locale.ROOT, "%s,%d,%.6f,%d%n", tgt.getHostName(),
++                        isAttacker(tgt) ? 1 : 0, n > 0 ? s / n : 0,
++                        tgt.getNodeForwards());
+             }
+         } catch (IOException e) {
+-            System.err.println("PoDCMetrics: cannot write per-node data — " + e);
++            System.err.println("PoDCMetrics: " + e);
+         }
+     }
+ 
+-    public void printSummary() {
+-        System.out.println("--- PoDC metrics summary ---");
+-        System.out.printf("  created          : %d%n", created);
+-        System.out.printf("  delivered        : %d%n", delivered);
+-        System.out.printf("  delivery_ratio   : %.4f%n", deliveryRatio());
+-        System.out.printf("  overhead_ratio   : %.4f%n", overheadRatio());
+-        System.out.printf("  avg_latency (s)  : %.2f%n", avgLatency());
+-        System.out.printf("  avg_hops         : %.2f%n", avgHops());
+-        System.out.printf("  gini_work        : %.6f%n", giniWork());
+-        System.out.printf("  avg_proof_bytes  : %.1f%n", avgProofBytes());
+-        System.out.printf("  total_forwarded  : %d%n", relayed);
+-        System.out.printf("  total_rejected   : %d%n", rejected);
+-        System.out.printf("  total_acks       : %d%n", acksProcessed);
+-        System.out.printf("  total_invalid    : %d%n", invalidAcks);
+-    }
+-
+-    public void reset() {
+-        created = delivered = 0;
+-        relayed = rejected = acksProcessed = invalidAcks = 0;
+-        latencies.clear();
+-        hopCounts.clear();
+-        proofBytes.clear();
+-        forwardBins.clear();
+-        giniBins.clear();
+-        lastGiniBin = -1;
+-    }
+-
+-    /* ---- helpers ---- */
+-
+     private static double avg(List<Double> v) {
+-        if (v.isEmpty()) return 0;
+         double s = 0;
+         for (double d : v) s += d;
+-        return s / v.size();
++        return v.isEmpty() ? 0 : s / v.size();
++    }
++
++    private static double avgI(List<Integer> v) {
++        double s = 0;
++        for (int d : v) s += d;
++        return v.isEmpty() ? 0 : s / v.size();
+     }
+ 
+     static double gini(List<Double> values) {
+@@ -271,12 +191,12 @@ public final class PoDCMetrics {
+         if (n == 0) return 0;
+         List<Double> sorted = new ArrayList<Double>(values);
+         Collections.sort(sorted);
+-        double sum = 0, cumSum = 0;
++        double sum = 0, cum = 0;
+         for (int i = 0; i < n; i++) {
+-            sum    += sorted.get(i);
+-            cumSum += sorted.get(i) * (i + 1);
++            sum += sorted.get(i);
++            cum += sorted.get(i) * (i + 1);
+         }
+         if (sum == 0) return 0;
+-        return (2.0 * cumSum) / (n * sum) - (n + 1.0) / n;
++        return (2.0 * cum) / (n * sum) - (n + 1.0) / n;
+     }
+ }
+diff --git a/src/routing/podc/ProofEntry.java b/src/routing/podc/ProofEntry.java
+index d6a802b..6238f49 100644
+--- a/src/routing/podc/ProofEntry.java
++++ b/src/routing/podc/ProofEntry.java
+@@ -5,6 +5,7 @@ import java.security.GeneralSecurityException;
+ import java.security.KeyFactory;
+ import java.security.MessageDigest;
+ import java.security.NoSuchAlgorithmException;
++import java.security.PrivateKey;
+ import java.security.PublicKey;
+ import java.security.Signature;
+ import java.security.spec.X509EncodedKeySpec;
+@@ -12,15 +13,12 @@ import java.security.spec.X509EncodedKeySpec;
+ /**
+  * A single record in a message's proof-of-delivery chain.
+  *
+- * Each forwarding hop appends one {@code ProofEntry} to the message.
+- * The chain is linked via {@link #prevHash}: the first entry uses
+- * {@code "0"}, each subsequent entry stores the SHA-256 hash of
+- * its predecessor.
+- *
+- * <p>The {@link #signature} is a 64-byte Ed25519 digital signature over
+- * the canonical data string {@code nodeId|timestamp|prevHash}.
+- * {@link #publicKey} carries the signer's X.509-encoded Ed25519 public
+- * key so that any node can call {@link #verify()} without a global PKI.</p>
++ * The node identifier is self-certifying: it must equal
++ * {@link #fingerprint(byte[])} of the embedded Ed25519 public key, so an
++ * entry can only be produced by the holder of the matching private key.
++ * Entries are linked via {@link #prevHash}; the first entry of a chain
++ * links to the genesis value {@link #genesis(String, String, String)}
++ * that binds the message id, the source and the destination.
+  */
+ public class ProofEntry {
+ 
+@@ -30,16 +28,8 @@ public class ProofEntry {
+     private final byte[] signature;
+     private final byte[] publicKey;
+     private transient String cachedHash;
++    private transient Boolean cachedValid;
+ 
+-    /**
+-     * @param nodeId    {@code DTNHost.toString()} of the forwarding node
+-     * @param timestamp simulation second (truncated from {@code SimClock})
+-     * @param prevHash  {@link #computeHash()} of the previous entry, or
+-     *                  {@code "0"} for the very first entry
+-     * @param signature Ed25519 signature (64 bytes) over
+-     *                  {@code nodeId|timestamp|prevHash}
+-     * @param publicKey X.509-encoded Ed25519 public key of the signer
+-     */
+     public ProofEntry(String nodeId, long timestamp, String prevHash,
+                       byte[] signature, byte[] publicKey) {
+         this.nodeId    = nodeId;
+@@ -49,54 +39,98 @@ public class ProofEntry {
+         this.publicKey = publicKey != null ? publicKey.clone() : new byte[0];
+     }
+ 
+-    /** Canonical data string used for both signing and hashing. */
++    /** Creates and signs an entry for the holder of {@code priv}. */
++    public static ProofEntry create(long timestamp, String prevHash,
++                                    PrivateKey priv, byte[] pubEncoded) {
++        String id = fingerprint(pubEncoded);
++        byte[] sig = sign(priv, canonical(id, timestamp, prevHash));
++        return new ProofEntry(id, timestamp, prevHash, sig, pubEncoded);
++    }
++
++    private static String canonical(String id, long ts, String prev) {
++        return id + "|" + ts + "|" + prev;
++    }
++
+     private String canonicalData() {
+-        return nodeId + "|" + timestamp + "|" + prevHash;
++        return canonical(nodeId, timestamp, prevHash);
+     }
+ 
+     private static final char[] HEX = "0123456789abcdef".toCharArray();
+ 
+-    /** SHA-256 hex digest of {@link #canonicalData()}. */
+-    public String computeHash() {
+-        if (cachedHash != null) return cachedHash;
++    public static String sha256Hex(String s) {
++        return sha256Hex(s.getBytes(StandardCharsets.UTF_8));
++    }
++
++    public static String sha256Hex(byte[] data) {
+         try {
+-            MessageDigest md = MessageDigest.getInstance("SHA-256");
+-            byte[] dig = md.digest(
+-                    canonicalData().getBytes(StandardCharsets.UTF_8));
++            byte[] dig = MessageDigest.getInstance("SHA-256").digest(data);
+             char[] hex = new char[dig.length * 2];
+             for (int i = 0; i < dig.length; i++) {
+                 int v = dig[i] & 0xFF;
+                 hex[i * 2]     = HEX[v >>> 4];
+                 hex[i * 2 + 1] = HEX[v & 0x0F];
+             }
+-            cachedHash = new String(hex);
+-            return cachedHash;
++            return new String(hex);
+         } catch (NoSuchAlgorithmException e) {
+             throw new AssertionError("SHA-256 unavailable", e);
+         }
+     }
+ 
++    /** Node identifier derived from an X.509-encoded Ed25519 public key. */
++    public static String fingerprint(byte[] pubEncoded) {
++        return sha256Hex(pubEncoded).substring(0, 32);
++    }
++
++    /** Value the first entry of a chain must link to. */
++    public static String genesis(String msgId, String srcId, String dstId) {
++        return "G" + sha256Hex(msgId + "|" + srcId + "|" + dstId);
++    }
++
++    public String computeHash() {
++        if (cachedHash == null) cachedHash = sha256Hex(canonicalData());
++        return cachedHash;
++    }
++
+     /**
+-     * Verifies the Ed25519 signature against this entry's
+-     * {@link #publicKey} and {@link #canonicalData()}.
+-     *
+-     * @return {@code true} only if the signature is cryptographically valid
++     * Checks the identity binding and the Ed25519 signature.
++     * Verification is deterministic; the result is memoized because in
++     * the simulator all copies of a message share this object.
+      */
+-    private static final boolean FAST_CRYPTO =
+-            Boolean.getBoolean("podc.fastCrypto");
+-
+     public boolean verify() {
+-        if (FAST_CRYPTO) return true;
++        if (cachedValid != null) return cachedValid;
++        boolean ok = nodeId.equals(fingerprint(publicKey));
++        if (ok) {
++            try {
++                PublicKey pk = KeyFactory.getInstance("Ed25519")
++                        .generatePublic(new X509EncodedKeySpec(publicKey));
++                Signature v = Signature.getInstance("Ed25519");
++                v.initVerify(pk);
++                v.update(canonicalData().getBytes(StandardCharsets.UTF_8));
++                ok = v.verify(signature);
++            } catch (GeneralSecurityException e) {
++                ok = false;
++            }
++        }
++        cachedValid = ok;
++        return ok;
++    }
++
++    /** Entry that claims {@code claimedId} but is signed with another key. */
++    public static ProofEntry spoofed(String claimedId, long timestamp,
++                                     String prevHash, PrivateKey priv,
++                                     byte[] pubEncoded) {
++        byte[] sig = sign(priv, canonical(claimedId, timestamp, prevHash));
++        return new ProofEntry(claimedId, timestamp, prevHash, sig, pubEncoded);
++    }
++
++    static byte[] sign(PrivateKey key, String data) {
+         try {
+-            KeyFactory kf = KeyFactory.getInstance("Ed25519");
+-            PublicKey pk = kf.generatePublic(
+-                    new X509EncodedKeySpec(publicKey));
+-            Signature verifier = Signature.getInstance("Ed25519");
+-            verifier.initVerify(pk);
+-            verifier.update(canonicalData().getBytes(StandardCharsets.UTF_8));
+-            return verifier.verify(signature);
++            Signature s = Signature.getInstance("Ed25519");
++            s.initSign(key);
++            s.update(data.getBytes(StandardCharsets.UTF_8));
++            return s.sign();
+         } catch (GeneralSecurityException e) {
+-            return false;
++            throw new AssertionError("Ed25519 unavailable", e);
+         }
+     }
+ 
